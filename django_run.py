@@ -26,14 +26,15 @@ parser.add_argument('--name')
 parser.add_argument('--clear', action='store_true')
 parser.add_argument('--managed', action='store_true')
 parser.add_argument('--config', action='store_true')
+parser.add_argument('--open-all', action='store_true')
 
 args = parser.parse_args()
 
 
 class FirefoxAsyncLaunch(CommandTask):
 
-    def function(self, endpoint, *args, **kwargs):
-        time.sleep(2)
+    def function(self, endpoint, time=2, *args, **kwargs):
+        time.sleep(time)
         sh.firefox(endpoint)
 
 
@@ -268,6 +269,14 @@ def main():
         pprint(normal_nginx_config, Mode.NORMAL, continuous=True)
         sys.exit(0)
 
+    if args.open_all:
+        for host in active_hosts:
+            pprint('Opening {} endpoint in firefox'.format(host))
+
+            sh.firefox('http://{}'.format(host))
+
+        sys.exit(0)
+
     if not args.name:
         server_endpoint = 'local.{}'.format(active_tmux_windows)
 
@@ -312,6 +321,10 @@ def main():
         FirefoxAsyncLaunch('http://{}'.format(server_endpoint)).start()
 
     if not is_active and location_managepy:
+        pprint('Opening the endpoint in firefox, since \'--no-open\' is not passed', Mode.OPERATION)
+
+        FirefoxAsyncLaunch('http://{}'.format(server_endpoint)).start()
+
         pprint('Running django server {} @ {}'.format(server_endpoint, choosen_ip))
 
         django_server_activate(active_hosts[server_endpoint])
