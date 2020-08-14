@@ -1,2 +1,2 @@
 #!/bin/bash
-/home/legrems/miniconda3/bin/python /home/legrems/custom_commands/django_run.py
+/home/legrems/miniconda3/bin/python /home/legrems/custom_commands/django_run.py "$@"

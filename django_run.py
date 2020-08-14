@@ -1,6 +1,12 @@
+from GenericClass.Task import CommandTask
+
+
+import re
 import os
 import sh
 import sys
+import time
+import psutil
 import argparse
 import subprocess
 from enum import Enum
@@ -12,13 +18,23 @@ BASE_PORT = '8000'
 ANCHOR_START = """### START AUTO MANAGE ###"""
 ANCHOR_STOP = """### STOP AUTO MANAGE ###"""
 
-IPS = ['127.0.0.{}'.format(i) for i in range(1, 250)]
+IPS = ['127.0.0.{}'.format(i) for i in range(2, 250)]
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--no-open', action='store_true')
 parser.add_argument('--name')
+parser.add_argument('--clear', action='store_true')
+parser.add_argument('--managed', action='store_true')
+parser.add_argument('--config', action='store_true')
 
 args = parser.parse_args()
+
+
+class FirefoxAsyncLaunch(CommandTask):
+
+    def function(self, endpoint, *args, **kwargs):
+        time.sleep(2)
+        sh.firefox(endpoint)
 
 
 class Mode(Enum):
@@ -30,6 +46,7 @@ class Mode(Enum):
     WARNING = '\033[93m'
     INFO = '\033[93m'
     BOLD = '\033[1m'
+    INTEROGATION = '\033[36m'
 
 
 def pprint(text, mode=Mode.OK, end='\n', continuous=False):
@@ -45,6 +62,9 @@ def pprint(text, mode=Mode.OK, end='\n', continuous=False):
     elif mode == Mode.OPERATION:
         marker = ' >> '
 
+    elif mode == Mode.INTEROGATION:
+        marker = ' ?? '
+
     to_write = '{}{} {}{}'.format(mode.value, marker, text, Mode.NORMAL.value)
 
     if continuous:
@@ -54,12 +74,22 @@ def pprint(text, mode=Mode.OK, end='\n', continuous=False):
         print(to_write, end=end)
 
 
-def get_active_djangos():
-    try:
-        active_djangos = sh.grep.bake('-Po')(sh.ps('-aux', _piped=True), '(?<=/bin/python manage.py runserver )[0-9.:]+')
-        return list(filter(lambda x: x, active_djangos))
-    except Exception:
-        return []
+def get_active_djangos(get_name=False):
+
+    active_djangos = []
+    for proc in psutil.process_iter(['cmdline']):
+
+        cmdline = ' '.join(proc.info['cmdline'])
+        if '/bin/python manage.py runserver' in cmdline:
+            django_ip = proc.info['cmdline'][-1]
+
+            if get_name:
+                active_djangos.append({'ip': django_ip, 'location': proc.info['cmdline'][0]})
+
+            else:
+                active_djangos.append(django_ip)
+
+    return active_djangos
 
 
 def get_managed_host():
@@ -74,8 +104,11 @@ def get_managed_host():
     for line in all_etc_host().split('\n'):
 
         if managed and line != ANCHOR_STOP:
-            ip, name = line.split('\t')
-            managed_host[name] = ip
+            try:
+                ip, name = line.split('\t')
+                managed_host[name] = ip
+            except Exception:
+                pass
 
         if line == ANCHOR_START:
             managed = True
@@ -105,7 +138,6 @@ def search_free_dev_ip():
         if ip not in {v: k for k, v in all_hosts.items()}:
             pprint('    {} <=='.format(ip), continuous=True)
             choosen_ip = ip
-
             break
 
         pprint('    {} X'.format(ip), Mode.FAIL, continuous=True)
@@ -168,20 +200,73 @@ def get_managepy_file():
     return location
 
 
-def is_django_active(ip):
-    return ip in get_active_djangos()
+def is_django_active(endpoint):
+    active_djangos = get_active_djangos()
+
+    if endpoint not in active_djangos:
+        return False
+
+    return '{}:{}'.format(ip, BASE_PORT) in active_djangos()
 
 
 def django_server_activate(endpoint):
-    sh.python('manage.py', 'runserver', '{}:{}'.format(endpoint, BASE_PORT))
+    subprocess.call(['python', 'manage.py', 'runserver', '{}:{}'.format(endpoint, BASE_PORT)])
+
+
+def clear_all():
+    pprint('Removing /etc/hosts managed configs')
+    update_managed_host({})
+    pprint('Removing nginx managed config')
+    update_nginx_config('')
 
 
 def main():
 
     skip_creation = False
 
+    choosen_ip = ''
+
     active_hosts = get_managed_host()
     active_tmux_windows = get_tmux_windows_name()
+
+    if args.clear:
+        clear_all()
+        sys.exit(0)
+
+    if args.managed:
+        pprint('Managed hosts: ', Mode.OPERATION)
+
+        for host, ip in active_hosts.items():
+
+            text = '{} @ {}'.format(host, ip)
+            if is_django_active(host):
+                pprit(text, continuous=True)
+
+            else:
+                pprint(text, Mode.FAIL, continuous=True)
+
+        pprint('Running djangos: ', Mode.OPERATION)
+        for running_django in get_active_djangos(get_name=True):
+            pprint(running_django['location'], continuous=True, end='')
+            pprint(" : with IP: ", Mode.OPERATION, continuous=True, end='')
+            pprint(running_django['ip'], continuous=True)
+
+        pprint('Normaly, this is correct:', Mode.OPERATION)
+
+        for host, ip in active_hosts.items():
+            for running_django in get_active_djangos(get_name=True):
+                if '{}:{}'.format(ip, BASE_PORT) == running_django['ip']:
+                    pprint('{} - {}'.format(ip, host), continuous=True)
+                    pprint(running_django['location'], Mode.INTEROGATION)
+
+        sys.exit(0)
+
+    if args.config:
+        pprint('Normal nginx config file:', Mode.OPERATION)
+        normal_nginx_config = create_nginx_config(active_hosts)
+
+        pprint(normal_nginx_config, Mode.NORMAL, continuous=True)
+        sys.exit(0)
 
     if not args.name:
         server_endpoint = 'local.{}'.format(active_tmux_windows)
@@ -199,20 +284,14 @@ def main():
         pprint('Manage.py file found: {}'.format(location_managepy))
 
     if server_endpoint in active_hosts:
+        skip_creation = True
+
         pprint('Host already in config for this name!', Mode.FAIL)
         pprint('Ip for {} is {}'.format(server_endpoint, active_hosts[server_endpoint]), Mode.INFO)
 
-        if not is_django_active(active_hosts[server_endpoint]) and location_managepy:
-            django_server_activate(active_hosts[server_endpoint])
-
-        if not args.no_open:
-            pprint('Opening {}'.format(active_hosts[server_endpoint]), Mode.OPERATION)
-            sh.firefox('http://{}'.format(server_endpoint))
-        sys.exit(1)
+        choosen_ip = active_hosts[server_endpoint]
 
     if not skip_creation:
-        pprint('Set name for server as "{}"'.format(server_endpoint))
-
         choosen_ip = search_free_dev_ip()
 
         pprint('Creating /etc/hosts config for {} @ {}'.format(server_endpoint, choosen_ip))
@@ -225,13 +304,23 @@ def main():
         nginx_config = create_nginx_config(active_hosts)
         update_nginx_config(nginx_config)
 
-        if not args.no_open:
-            pprint('Opening the endpoint in firefox, since \'--open\' is passed', Mode.OPERATION)
-            sh.firefox('http://{}'.format(server_endpoint))
+    is_active = is_django_active(server_endpoint)
 
+    if not args.no_open and is_active:
+        pprint('Opening the endpoint in firefox, since \'--no-open\' is not passed', Mode.OPERATION)
+
+        FirefoxAsyncLaunch('http://{}'.format(server_endpoint)).start()
+
+    if not is_active and location_managepy:
         pprint('Running django server {} @ {}'.format(server_endpoint, choosen_ip))
 
         django_server_activate(active_hosts[server_endpoint])
+
+    elif not location_managepy:
+        pprint('Exiting ...', Mode.FAIL)
+
+    else:
+        pprint('Django server already running!')
 
 
 main()
