@@ -4,14 +4,18 @@ from GenericClass.Task import CommandTask
 import re
 import os
 import sh
+import io
 import sys
 import time
+import copy
+import string
 import psutil
 import argparse
 import subprocess
 from enum import Enum
 from tempfile import NamedTemporaryFile
-from nginx.config.api import Config, Section, Location
+from nginx.config.api.options import KeyValuesMultiLines
+from nginx.config.api import Config, Section, Location, KeyValueOption
 
 
 BASE_PORT = '8000'
@@ -20,13 +24,22 @@ ANCHOR_STOP = """### STOP AUTO MANAGE ###"""
 
 IPS = ['127.0.0.{}'.format(i) for i in range(2, 250)]
 
+SERVER_NAME_FORMAT = "{}.local"
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--no-open', action='store_true')
-parser.add_argument('--name')
-parser.add_argument('--clear', action='store_true')
-parser.add_argument('--managed', action='store_true')
-parser.add_argument('--config', action='store_true')
-parser.add_argument('--open-all', action='store_true')
+parser.add_argument('--no-open', action="store_true")
+parser.add_argument('--name', help=("A name for the local host: XXX will be available on XXX.local. If there is no name parameters, the window's name on the tmux session is taken by default"))
+parser.add_argument('--raw-name', help=("A raw name for the local host: XXX will be available on XXX."))
+parser.add_argument('--see-tmux-name', action="store_true", help=("See your tmux window's name, see --name for why."))
+parser.add_argument('--clear', action="store_true", help=("Clear managed host and managed nginx config"))
+parser.add_argument('--confirm-clear', action="store_true", help=("Needed to confirm clear, see --clear"))
+parser.add_argument('--managed', action="store_true", help=("Display managed django server"))
+parser.add_argument('--config', action="store_true", help=("Display nginx managed config"))
+parser.add_argument('--open-all', action="store_true", help=("Open all active django server"))
+parser.add_argument('--reload-config', action="store_true", help=("Rewrite managed host and nginx config"))
+parser.add_argument('--remove', nargs="+", type=str, help=("Remove a entry in the host list, case insensitive"))
+parser.add_argument('--no-celery', action="store_true", help=("Don't run celery subprocess"))
+parser.add_argument('--sls', action="store_true", help=("Generate SLS command for gestion/gestion-extra"))
 
 args = parser.parse_args()
 
@@ -36,6 +49,15 @@ class FirefoxAsyncLaunch(CommandTask):
     def function(self, endpoint, time=2, *args, **kwargs):
         time.sleep(time)
         sh.firefox(endpoint)
+
+
+class CeleryWorker(CommandTask):
+
+    def function(self, endpoint, *args, **kwargs):
+        command_string = "celery -A app worker -l info -B -E -n {}"
+        worker_name = "worker-{}".format(endpoint.replace(".local", ""))
+        pprint("Launching celery with worker name {}".format(worker_name))
+        subprocess.Popen(command_string.format(worker_name).split(" "), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 class Mode(Enum):
@@ -63,6 +85,9 @@ def pprint(text, mode=Mode.OK, end='\n', continuous=False):
     elif mode == Mode.OPERATION:
         marker = ' >> '
 
+    elif mode == Mode.WARNING:
+        marker = ' !! '
+
     elif mode == Mode.INTEROGATION:
         marker = ' ?? '
 
@@ -85,7 +110,8 @@ def get_active_djangos(get_name=False):
             django_ip = proc.info['cmdline'][-1]
 
             if get_name:
-                active_djangos.append({'ip': django_ip, 'location': proc.info['cmdline'][0]})
+                short_location = proc.info['cmdline'][0].replace(os.path.join(os.getenv("HOME"), 'miniconda3/envs/'), '').replace('/bin/python', '')
+                active_djangos.append({'ip': django_ip, 'location': short_location})
 
             else:
                 active_djangos.append(django_ip)
@@ -160,6 +186,55 @@ def create_nginx_config(hosts):
         ) for key, value in hosts.items()
     ]
 
+    if False:  # Old and false
+        sections.append(
+            Section(
+                'server',
+                *(Location(
+                    '/{}/'.format(key.replace(SERVER_NAME_FORMAT.format(''), '')),
+                    KeyValueOption('include', 'proxy_params'),
+                    KeyValueOption('rewrite', '^/{}(/.*)$ http://{}$1 last'.format(key.replace(SERVER_NAME_FORMAT.format(''), ''), key)),
+                    KeyValueOption('proxy_pass', 'http://{}:{}'.format(value, BASE_PORT)),
+                    KeyValueOption('proxy_redirect', 'http://{}:{}/ $scheme://$host:$server_port/'.format(value, BASE_PORT)),
+                    KeyValuesMultiLines('proxy_set_header', [
+                        ['X-Real-IP', '$remote_addr'],
+                        ['X-Forwarded-For', '$proxy_add_x_forwarded_for'],
+                        # ['Host', 'django.local'],
+                        ['X-Forwarded-Proto', '$scheme'],
+                    ]),
+                ) for key, value in hosts.items()),
+                listen='80',
+                server_name=SERVER_NAME_FORMAT.format('django'),
+            )
+        )
+
+    sections.append(
+        Section(
+            "server",
+            *[
+                Location(
+                    "/",
+                    # KeyValueOption("rewrite", "^/{}(/.*)$ $1 break".format(key.rstrip(SERVER_NAME_FORMAT.format("")))),
+                    # KeyValueOption("proxy_pass", "http://{}:{}/".format(value, BASE_PORT)),
+                    # KeyValueOption("proxy_redirect", "http://{}:{}/ /".format(value, BASE_PORT)),
+                    # KeyValueOption("proxy_redirect", "$scheme://$host:$server_port/ /test/"),
+                    # KeyValueOption("proxy_set_header", "X-Real-IP $remote_addr"),
+                    # KeyValueOption("proxy_set_header", "X-Forwarded-For $proxy_add_x_forwarded_for"),
+                    # KeyValueOption("proxy_set_header", "Host $host"),
+                    # KeyValueOption("proxy_set_header", "X-Forwarded-Proto $scheme"),
+                    # KeyValueOption("proxy_buffering", "off"),
+                    # KeyValueOption("proxy_http_version", "1.1"),
+                    # KeyValueOption("proxy_request_buffering", "off"),
+                    KeyValueOption("include", "proxy_params"),
+                    KeyValueOption("proxy_pass", "http://127.0.0.2:8000/"),
+                ) for key, value in hosts.items()
+            ],
+            listen="80",
+            server_name=SERVER_NAME_FORMAT.format("django"),
+            client_max_body_size=0,
+        )
+    )
+
     return '\n'.join(map(str, sections))
 
 
@@ -184,7 +259,8 @@ def update_nginx_config(config):
 
     pprint('Reloading nginx service')
 
-    sh.sudo('service', 'nginx', 'reload')
+    # sh.sudo('service', 'nginx', 'reload')
+    sh.sudo('systemctl', 'restart', 'nginx')
 
 
 def get_tmux_windows_name():
@@ -210,7 +286,11 @@ def is_django_active(endpoint):
     return '{}:{}'.format(ip, BASE_PORT) in active_djangos()
 
 
-def django_server_activate(endpoint):
+def django_server_activate(endpoint, commands=[]):
+    for c in commands:
+        pprint("Running command: {}".format(c))
+        subprocess.call(c.split(" "))
+
     subprocess.call(['python', 'manage.py', 'runserver', '{}:{}'.format(endpoint, BASE_PORT)])
 
 
@@ -231,8 +311,13 @@ def main():
     active_tmux_windows = get_tmux_windows_name()
 
     if args.clear:
-        clear_all()
-        sys.exit(0)
+        if not args.confirm_clear:
+            pprint("It's gonna erase ALL managed host, and ALL managed nginx config, use --confirm-clear to to so", Mode.WARNING)
+            sys.exit(0)
+
+        else:
+            clear_all()
+            sys.exit(0)
 
     if args.managed:
         pprint('Managed hosts: ', Mode.OPERATION)
@@ -240,25 +325,33 @@ def main():
         for host, ip in active_hosts.items():
 
             text = '{} @ {}'.format(host, ip)
-            if is_django_active(host):
-                pprit(text, continuous=True)
+            pprint(text)
 
-            else:
-                pprint(text, Mode.FAIL, continuous=True)
-
-        pprint('Running djangos: ', Mode.OPERATION)
+        pprint('Found running django servers: ', Mode.OPERATION)
         for running_django in get_active_djangos(get_name=True):
+
             pprint(running_django['location'], continuous=True, end='')
             pprint(" : with IP: ", Mode.OPERATION, continuous=True, end='')
             pprint(running_django['ip'], continuous=True)
 
-        pprint('Normaly, this is correct:', Mode.OPERATION)
+        pprint('Normaly, those are correct and running:', Mode.OPERATION)
 
         for host, ip in active_hosts.items():
             for running_django in get_active_djangos(get_name=True):
                 if '{}:{}'.format(ip, BASE_PORT) == running_django['ip']:
-                    pprint('{} - {}'.format(ip, host), continuous=True)
-                    pprint(running_django['location'], Mode.INTEROGATION)
+                    pprint('{}{}{} - {}{: <30}{} => {}(env){} {}{}{}'.format(
+                        Mode.BOLD.value,
+                        ip,
+                        Mode.NORMAL.value,
+                        Mode.INFO.value,
+                        host,
+                        Mode.NORMAL.value,
+                        Mode.BOLD.value,
+                        Mode.NORMAL.value,
+                        Mode.OPERATION.value,
+                        running_django['location'],
+                        Mode.NORMAL.value
+                    ))
 
         sys.exit(0)
 
@@ -270,18 +363,50 @@ def main():
         sys.exit(0)
 
     if args.open_all:
-        for host in active_hosts:
-            pprint('Opening {} endpoint in firefox'.format(host))
+        for host in get_active_djangos(get_name=True):
+            pprint('Opening [{}] endpoint in firefox [IP={}]'.format(host["location"], host["ip"]))
 
-            sh.firefox('http://{}'.format(host))
+            FirefoxAsyncLaunch('http://{}'.format(SERVER_NAME_FORMAT.format(host["location"]))).start()
 
         sys.exit(0)
 
-    if not args.name:
-        server_endpoint = 'local.{}'.format(active_tmux_windows)
+    if args.remove:
+        pprint("Following host will be erased:", Mode.WARNING)
+        old_active_hosts = copy.deepcopy(active_hosts)
 
-    else:
-        server_endpoint = args.name
+        for to_remove in args.remove:
+            for host, ip in old_active_hosts.items():
+                # Remove if name match
+                if to_remove.lower() in host:
+                    pprint("Removing {} with ip {}".format(host, ip))
+
+                    active_hosts.pop(host, None)
+
+                # Or ip
+                if to_remove.lower() in ip:
+                    pprint("Removing {} with ip {}".format(host, ip))
+
+                    active_hosts.pop(host, None)
+
+        if not args.reload_config:
+            pprint("No host realy removed, to apply change, use --reload-config to write down the config")
+
+    if args.reload_config:
+
+        update_managed_host(active_hosts)
+        update_nginx_config(create_nginx_config(active_hosts))
+        sys.exit(0)
+
+    if args.see_tmux_name:
+        pprint("Tmux window's name: {}, server host: {}".format(active_tmux_windows, SERVER_NAME_FORMAT.format(active_tmux_windows)), Mode.INFO)
+
+    server_endpoint = SERVER_NAME_FORMAT.format(active_tmux_windows)
+
+    if args.name:
+        server_endpoint = SERVER_NAME_FORMAT.format(args.name)
+
+    if args.raw_name:
+        server_endpoint = args.raw_name
 
     location_managepy = get_managepy_file()
 
@@ -327,7 +452,16 @@ def main():
 
         pprint('Running django server {} @ {}'.format(server_endpoint, choosen_ip))
 
-        django_server_activate(active_hosts[server_endpoint])
+        if not args.no_celery:
+            CeleryWorker(server_endpoint).start()
+
+        pre_command = []
+        commands = []
+        if args.sls:
+            commands.append("python manage.py generate_sls tmp_states -yy")
+            commands.append("python manage.py generate_extra_sls tmp_states_extra -yy")
+
+        django_server_activate(active_hosts[server_endpoint], commands)
 
     elif not location_managepy:
         pprint('Exiting ...', Mode.FAIL)
