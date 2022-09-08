@@ -38,8 +38,9 @@ parser.add_argument('--config', action="store_true", help=("Display nginx manage
 parser.add_argument('--open-all', action="store_true", help=("Open all active django server"))
 parser.add_argument('--reload-config', action="store_true", help=("Rewrite managed host and nginx config"))
 parser.add_argument('--remove', nargs="+", type=str, help=("Remove a entry in the host list, case insensitive"))
-parser.add_argument('--no-celery', action="store_true", help=("Don't run celery subprocess"))
+parser.add_argument('--celery', action="store_true", help=("Run celery subprocess"))
 parser.add_argument('--sls', action="store_true", help=("Generate SLS command for gestion/gestion-extra"))
+parser.add_argument('--use-tmux-window-name', action="store_true", help=("Use the tmux window name for the name, instead of the env/project name"))
 
 args = parser.parse_args()
 
@@ -268,11 +269,42 @@ def get_tmux_windows_name():
     return tmux_name
 
 
+def get_project_name():
+    def normalize(txt):
+        return txt
+
+    folder = os.getcwd().split("/")
+    name = "Documents"
+    if name in folder:
+        return folder[folder.index(name) + 2]
+
+    # If we cannot find a project name, try with the venv name
+    sp = sys.path[1].split('/')
+    if "env" in sp:
+        return normalize(sp[sp.index("env") + 1])
+
+    return "default"
+
+
 def get_managepy_file():
-    location = None
-    for filename in os.listdir(os.getcwd()):
-        if filename == 'manage.py':
-            location = os.path.join(os.getcwd(), filename)
+    def search(folder):
+        location = None
+        for filename in os.listdir(folder):
+            if filename.endswith("manage.py"):
+                location = os.path.join(folder, filename)
+
+        return location
+
+    folder = os.getcwd()
+    location = search(folder)
+
+    if not location:
+        for file in os.listdir(folder):
+            filename = os.path.join(folder, file)
+            if os.path.isdir(filename):
+                loc = search(filename)
+                if loc:
+                    location = loc
 
     return location
 
@@ -286,12 +318,12 @@ def is_django_active(endpoint):
     return '{}:{}'.format(ip, BASE_PORT) in active_djangos()
 
 
-def django_server_activate(endpoint, commands=[]):
+def django_server_activate(managepy_location, endpoint, commands=[]):
     for c in commands:
         pprint("Running command: {}".format(c))
         subprocess.call(c.split(" "))
 
-    subprocess.call(['python', 'manage.py', 'runserver', '{}:{}'.format(endpoint, BASE_PORT)])
+    subprocess.call(['python', managepy_location, 'runserver', '{}:{}'.format(endpoint, BASE_PORT)])
 
 
 def clear_all():
@@ -308,7 +340,12 @@ def main():
     choosen_ip = ''
 
     active_hosts = get_managed_host()
-    active_tmux_windows = get_tmux_windows_name()
+
+    if args.use_tmux_window_name:
+        active_tmux_windows = get_tmux_windows_name()
+
+    else:
+        active_tmux_windows = get_project_name()
 
     if args.clear:
         if not args.confirm_clear:
@@ -452,16 +489,16 @@ def main():
 
         pprint('Running django server {} @ {}'.format(server_endpoint, choosen_ip))
 
-        if not args.no_celery:
+        if args.celery:
             CeleryWorker(server_endpoint).start()
 
         pre_command = []
         commands = []
         if args.sls:
-            commands.append("python manage.py generate_sls tmp_states -yy")
-            commands.append("python manage.py generate_extra_sls tmp_states_extra -yy")
+            commands.append(f"python {location_managepy} generate_sls tmp_states -yy")
+            commands.append(f"python {location_managepy} generate_extra_sls tmp_states_extra -yy")
 
-        django_server_activate(active_hosts[server_endpoint], commands)
+        django_server_activate(location_managepy, active_hosts[server_endpoint], commands)
 
     elif not location_managepy:
         pprint('Exiting ...', Mode.FAIL)
