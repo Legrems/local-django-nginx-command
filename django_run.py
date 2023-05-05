@@ -30,9 +30,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--no-open', action="store_true")
 parser.add_argument('--name', help=("A name for the local host: XXX will be available on XXX.local. If there is no name parameters, the window's name on the tmux session is taken by default"))
 parser.add_argument('--raw-name', help=("A raw name for the local host: XXX will be available on XXX."))
+parser.add_argument('--suffix-name', help=("Suffix name to the env found: {env}.{suffix}.local"))
+parser.add_argument('--prefix-name', help=("Prefix name to the env found: {prefix}.{env}.local"))
 parser.add_argument('--see-tmux-name', action="store_true", help=("See your tmux window's name, see --name for why."))
 parser.add_argument('--clear', action="store_true", help=("Clear managed host and managed nginx config"))
 parser.add_argument('--confirm-clear', action="store_true", help=("Needed to confirm clear, see --clear"))
+parser.add_argument('--erase', type=str, nargs="+", help=("Erase an entry in etc/hosts as well as in nginx"))
 parser.add_argument('--managed', action="store_true", help=("Display managed django server"))
 parser.add_argument('--config', action="store_true", help=("Display nginx managed config"))
 parser.add_argument('--open-all', action="store_true", help=("Open all active django server"))
@@ -107,7 +110,7 @@ def get_active_djangos(get_name=False):
     for proc in psutil.process_iter(['cmdline']):
 
         cmdline = ' '.join(proc.info['cmdline'])
-        if '/bin/python manage.py runserver' in cmdline:
+        if 'manage.py runserver' in cmdline and "bin/python" in cmdline:
             django_ip = proc.info['cmdline'][-1]
 
             if get_name:
@@ -323,7 +326,7 @@ def django_server_activate(managepy_location, endpoint, commands=[]):
         pprint("Running command: {}".format(c))
         subprocess.call(c.split(" "))
 
-    subprocess.call(['python', managepy_location, 'runserver', '{}:{}'.format(endpoint, BASE_PORT)])
+    subprocess.call(['python', managepy_location, 'runserver_plus', '{}:{}'.format(endpoint, BASE_PORT)])
 
 
 def clear_all():
@@ -340,6 +343,8 @@ def main():
     choosen_ip = ''
 
     active_hosts = get_managed_host()
+
+    print(get_active_djangos())
 
     if args.use_tmux_window_name:
         active_tmux_windows = get_tmux_windows_name()
@@ -368,7 +373,7 @@ def main():
         for running_django in get_active_djangos(get_name=True):
 
             pprint(running_django['location'], continuous=True, end='')
-            pprint(" : with IP: ", Mode.OPERATION, continuous=True, end='')
+            pprint(" : with IP: http://", Mode.OPERATION, continuous=True, end='')
             pprint(running_django['ip'], continuous=True)
 
         pprint('Normaly, those are correct and running:', Mode.OPERATION)
@@ -428,6 +433,17 @@ def main():
         if not args.reload_config:
             pprint("No host realy removed, to apply change, use --reload-config to write down the config")
 
+    if args.erase:
+
+        for to_be_erased in args.erase:
+            if active_hosts.get(to_be_erased):
+                active_hosts.pop(to_be_erased)
+                pprint(f"Removing {to_be_erased} from /etc/hosts and nginx config")
+
+        update_managed_host(active_hosts)
+        update_nginx_config(create_nginx_config(active_hosts))
+        sys.exit(0)
+
     if args.reload_config:
 
         update_managed_host(active_hosts)
@@ -437,7 +453,22 @@ def main():
     if args.see_tmux_name:
         pprint("Tmux window's name: {}, server host: {}".format(active_tmux_windows, SERVER_NAME_FORMAT.format(active_tmux_windows)), Mode.INFO)
 
-    server_endpoint = SERVER_NAME_FORMAT.format(active_tmux_windows)
+    which_python = sh.which("python")
+    rmatch = re.match(".*\/miniconda3\/envs\/(?P<env>.*)\/bin\/python", which_python)
+
+    if rmatch:
+        env = rmatch.groupdict().get("env")
+
+        if args.prefix_name:
+            env = f"{args.prefix_name}.{env}"
+
+        if args.suffix_name:
+            env = f"{env}.{args.suffix_name}"
+
+        server_endpoint = SERVER_NAME_FORMAT.format(env)
+
+    else:
+        server_endpoint = SERVER_NAME_FORMAT.format(active_tmux_windows)
 
     if args.name:
         server_endpoint = SERVER_NAME_FORMAT.format(args.name)
