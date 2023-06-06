@@ -44,8 +44,9 @@ parser.add_argument('--remove', nargs="+", type=str, help=("Remove a entry in th
 parser.add_argument('--celery', action="store_true", help=("Run celery subprocess"))
 parser.add_argument('--sls', action="store_true", help=("Generate SLS command for gestion/gestion-extra"))
 parser.add_argument('--use-tmux-window-name', action="store_true", help=("Use the tmux window name for the name, instead of the env/project name"))
+parser.add_argument('--use-nginx', action="store_true", help=("Use old nginx reverse proxy"))
 
-args = parser.parse_args()
+args, uargs = parser.parse_known_args()
 
 
 class FirefoxAsyncLaunch(CommandTask):
@@ -176,6 +177,18 @@ def search_free_dev_ip():
     return choosen_ip
 
 
+def create_caddy_config(hosts):
+    sections = [Section(key, KeyValueOption("reverse_proxy", f"{value}:8000")) for key, value in hosts.items()]
+    return '\n'.join(map(str, sections))
+
+
+def create_proxy_config(hosts):
+    if args.use_nginx:
+        return create_nginx_config(hosts)
+
+    return create_caddy_config(hosts)
+
+
 def create_nginx_config(hosts):
     sections = [
         Section(
@@ -242,29 +255,37 @@ def create_nginx_config(hosts):
     return '\n'.join(map(str, sections))
 
 
-def update_nginx_config(config):
-    nginx_file = '/etc/nginx/sites-available/managed'
+def update_proxy_config(config):
+    if args.use_nginx:
+        _update_proxy_config("/etc/nginx/sites-available/managed", config)
+
+    else:
+        _update_proxy_config("/etc/caddy/Caddyfile", config)
+
+    pprint('Reloading proxy service')
+    if args.use_nginx:
+        sh.sudo("systemctl", "restart", "nginx")
+
+    else:
+        sh.sudo("systemctl", "restart", "caddy")
+
+def _update_proxy_config(proxy_file, config):
 
     temp_name = ''
 
-    pprint('Write the nginx config in a temporary file')
+    pprint('Write the proxy config in a temporary file')
     with NamedTemporaryFile(delete=False) as temp:
         temp.write(config.encode('utf-8'))
 
         temp_name = temp.name
 
-    pprint('Removing the actual nginx config file "{}"'.format(nginx_file))
+    pprint('Removing the actual proxy config file "{}"'.format(proxy_file))
 
-    sh.sudo('rm', nginx_file)
+    sh.sudo('rm', proxy_file)
 
-    pprint('Copying the temporary file {} into the nginx conf'.format(temp_name))
+    pprint('Copying the temporary file {} into the proxy conf'.format(temp_name))
 
-    sh.sudo('cp', temp_name, nginx_file)
-
-    pprint('Reloading nginx service')
-
-    # sh.sudo('service', 'nginx', 'reload')
-    sh.sudo('systemctl', 'restart', 'nginx')
+    sh.sudo('cp', temp_name, proxy_file)
 
 
 def get_tmux_windows_name():
@@ -326,14 +347,14 @@ def django_server_activate(managepy_location, endpoint, commands=[]):
         pprint("Running command: {}".format(c))
         subprocess.call(c.split(" "))
 
-    subprocess.call(['python', managepy_location, 'runserver_plus', '{}:{}'.format(endpoint, BASE_PORT)])
+    subprocess.call(['python', managepy_location, 'runserver_plus', '{}:{}'.format(endpoint, BASE_PORT), *uargs])
 
 
 def clear_all():
     pprint('Removing /etc/hosts managed configs')
     update_managed_host({})
     pprint('Removing nginx managed config')
-    update_nginx_config('')
+    update_proxy_config('')
 
 
 def main():
@@ -398,10 +419,15 @@ def main():
         sys.exit(0)
 
     if args.config:
-        pprint('Normal nginx config file:', Mode.OPERATION)
-        normal_nginx_config = create_nginx_config(active_hosts)
+        if args.use_nginx:
+            pprint('Normal nginx config file:', Mode.OPERATION)
 
-        pprint(normal_nginx_config, Mode.NORMAL, continuous=True)
+        else:
+            pprint('Normal caddy config file:', Mode.OPERATION)
+
+        normal_proxy_config = create_proxy_config(active_hosts)
+
+        pprint(normal_proxy_config, Mode.NORMAL, continuous=True)
         sys.exit(0)
 
     if args.open_all:
@@ -441,13 +467,13 @@ def main():
                 pprint(f"Removing {to_be_erased} from /etc/hosts and nginx config")
 
         update_managed_host(active_hosts)
-        update_nginx_config(create_nginx_config(active_hosts))
+        update_proxy_config(create_proxy_config(active_hosts))
         sys.exit(0)
 
     if args.reload_config:
 
         update_managed_host(active_hosts)
-        update_nginx_config(create_nginx_config(active_hosts))
+        update_proxy_config(create_proxy_config(active_hosts))
         sys.exit(0)
 
     if args.see_tmux_name:
@@ -503,8 +529,8 @@ def main():
 
         pprint('Creating Nginx config for {} @ {}'.format(server_endpoint, choosen_ip))
 
-        nginx_config = create_nginx_config(active_hosts)
-        update_nginx_config(nginx_config)
+        nginx_config = create_proxy_config(active_hosts)
+        update_proxy_config(nginx_config)
 
     is_active = is_django_active(server_endpoint)
 
