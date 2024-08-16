@@ -4,18 +4,17 @@ from GenericClass.Task import CommandTask
 import re
 import os
 import sh
-import io
+import pip
 import sys
-import time
 import copy
-import string
 import psutil
+import pkgutil
 import argparse
 import subprocess
 from enum import Enum
 from tempfile import NamedTemporaryFile
 from nginx.config.api.options import KeyValuesMultiLines
-from nginx.config.api import Config, Section, Location, KeyValueOption
+from nginx.config.api import Section, Location, KeyValueOption, KeyOption
 
 
 BASE_PORT = '8000'
@@ -23,8 +22,6 @@ ANCHOR_START = """### START AUTO MANAGE ###"""
 ANCHOR_STOP = """### STOP AUTO MANAGE ###"""
 
 IPS = ['127.0.0.{}'.format(i) for i in range(2, 250)]
-
-SERVER_NAME_FORMAT = "{}.local"
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--no-open', action="store_true")
@@ -44,10 +41,17 @@ parser.add_argument('--remove', nargs="+", type=str, help=("Remove a entry in th
 parser.add_argument('--celery', action="store_true", help=("Run celery subprocess"))
 parser.add_argument('--sls', action="store_true", help=("Generate SLS command for gestion/gestion-extra"))
 parser.add_argument('--use-tmux-window-name', action="store_true", help=("Use the tmux window name for the name, instead of the env/project name"))
-parser.add_argument('--use-nginx', action="store_true", help=("Use old nginx reverse proxy"))
+parser.add_argument('--use-nginx', action="store_true", help=("Use old nginx reverse proxy [DEPRECATED in favor of Caddy]"))
+parser.add_argument('--use-ssl', action="store_true", help=("Use ssl for django webserver (using runserver_plus --cert-file cert.crt) [DEPRECATED in favor of Caddy]"))
+parser.add_argument('--extension', type=str, default='local', help=("Domain name extensions, default 'local'"))
+parser.add_argument('--with-debug', '-d', action="store_true", help=("Attach debugger debugpy to the runserver"))
+parser.add_argument('--no-wait-for-client', '-nw', action="store_true", help=("Don't pass the --wait-for-client argument to the debugger"))
 
 args, uargs = parser.parse_known_args()
 
+CERT_KEY_DEFAULT_PATH = "/home/legrems/Documents/django-certificates/"
+
+SERVER_NAME_FORMAT = f"{{}}.{args.extension}"
 
 class FirefoxAsyncLaunch(CommandTask):
 
@@ -60,7 +64,7 @@ class CeleryWorker(CommandTask):
 
     def function(self, endpoint, *args, **kwargs):
         command_string = "celery -A app worker -l info -B -E -n {}"
-        worker_name = "worker-{}".format(endpoint.replace(".local", ""))
+        worker_name = "worker-{}".format(endpoint.replace(f".{args.extension}", ""))
         pprint("Launching celery with worker name {}".format(worker_name))
         subprocess.Popen(command_string.format(worker_name).split(" "), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -156,7 +160,7 @@ def update_managed_host(hosts):
     replaced = '{}\\n{}\\n{}'.format(ANCHOR_START, middle, ANCHOR_STOP)
     sed_command = ["sudo", "sed", "-i", "-n", "/{}/{{:a;N;/{}/!ba;N;s/.*\\n/{}\\n/}};p".format(ANCHOR_START, ANCHOR_STOP, replaced), "/etc/hosts"]
 
-    process = subprocess.Popen(sed_command, stdout=subprocess.PIPE)
+    subprocess.Popen(sed_command, stdout=subprocess.PIPE)
 
 
 def search_free_dev_ip():
@@ -178,7 +182,7 @@ def search_free_dev_ip():
 
 
 def create_caddy_config(hosts):
-    sections = [Section(key, KeyValueOption("reverse_proxy", f"{value}:8000")) for key, value in hosts.items()]
+    sections = [Section(f"https://{key}", Section(f"reverse_proxy {value}:8000")) for key, value in hosts.items()]
     return '\n'.join(map(str, sections))
 
 
@@ -190,18 +194,61 @@ def create_proxy_config(hosts):
 
 
 def create_nginx_config(hosts):
-    sections = [
-        Section(
-            'server',
-            Location(
-                '/',
-                include='proxy_params',
-                proxy_pass='http://{}:{}'.format(value, BASE_PORT)
-            ),
-            listen='80',
-            server_name=key
-        ) for key, value in hosts.items()
-    ]
+    # sections = [
+    #     Section(
+    #         'server',
+    #         Location(
+    #             '/',
+    #             include='proxy_params',
+    #             proxy_pass='http://{}:{}'.format(value, BASE_PORT)
+    #         ),
+    #         listen='80',
+    #         server_name=key
+    #     ) for key, value in hosts.items()
+    # ]
+    sections = []
+
+    for key, value in hosts.items():
+        sections.append(
+            Section(
+                "server",
+                Location(
+                    "/",
+                    include="proxy_params",
+                    proxy_pass="http://{}:{}".format(value, BASE_PORT)
+                ),
+                listen="80",
+                server_name=key,
+            )
+        )
+
+        cert_file_path = os.path.join(CERT_KEY_DEFAULT_PATH, f"{key}.pem")
+        key_file_path = os.path.join(CERT_KEY_DEFAULT_PATH, f"{key}-key.pem")
+
+        if not os.path.exists(cert_file_path) or not os.path.exists(key_file_path):
+            print(os.path.exists(cert_file_path), cert_file_path)
+            print(os.path.exists(key_file_path), key_file_path)
+            continue
+
+        pprint(f"Doing SSL for {key} with:", Mode.INFO)
+        print("CERT FILE:", cert_file_path)
+        print("KEY FILE:", key_file_path)
+
+        # SSL
+        sections.append(
+            Section(
+                "server",
+                Location(
+                    "/",
+                    include="proxy_params",
+                    proxy_pass="https://{}:{}".format(value, BASE_PORT)
+                ),
+                ssl_certificate=cert_file_path,
+                ssl_certificate_key=key_file_path,
+                listen="443 ssl",
+                server_name=key,
+            )
+        )
 
     if False:  # Old and false
         sections.append(
@@ -287,6 +334,9 @@ def _update_proxy_config(proxy_file, config):
 
     sh.sudo('cp', temp_name, proxy_file)
 
+    if not args.use_nginx:
+        sh.sudo('chown', 'caddy:', proxy_file)
+
 
 def get_tmux_windows_name():
     tmux_name = sh.tmux.bake('display-message', '-p')('"#W"').split('\n', 1)[0].replace('"', '')
@@ -342,12 +392,19 @@ def is_django_active(endpoint):
     return '{}:{}'.format(ip, BASE_PORT) in active_djangos()
 
 
-def django_server_activate(managepy_location, endpoint, commands=[]):
+def django_server_activate(managepy_location, endpoint, commands=[], args=(), kwargs=None):
     for c in commands:
         pprint("Running command: {}".format(c))
         subprocess.call(c.split(" "))
 
-    subprocess.call(['python', managepy_location, 'runserver_plus', '{}:{}'.format(endpoint, BASE_PORT), *uargs])
+    command = ['python', managepy_location, 'runserver', '{}:{}'.format(endpoint, BASE_PORT), *args, *uargs]
+    if kwargs.with_debug:
+        command = ["python", "-m", "debugpy", "--wait-for-client", "--listen", f"{endpoint}:5678", managepy_location, "runserver", f"{endpoint}:{BASE_PORT}", *args, *uargs]
+
+        if kwargs.no_wait_for_client:
+            command.pop(3)
+
+    subprocess.call(command)
 
 
 def clear_all():
@@ -372,6 +429,20 @@ def main():
 
     else:
         active_tmux_windows = get_project_name()
+
+    if args.with_debug:
+        pass
+        # If we want the installer, we need to have it.
+        # This need to be done in the target venv, not in the django-run venv, aborting for now
+        # pprint("Searching for debugpy packages", Mode.INFO)
+        # for module in pkgutil.iter_modules():
+        #     if module.name == "debugpy":
+        #         pprint("Debugger debugpy found", Mode.INFO)
+        #         break
+        #
+        # else:
+        #     pprint("Debugger debugpy not found, installing", Mode.WARNING)
+        #     pip.main(["install", "debugpy"])
 
     if args.clear:
         if not args.confirm_clear:
@@ -511,6 +582,13 @@ def main():
     else:
         pprint('Manage.py file found: {}'.format(location_managepy))
 
+    cert_file_name = os.path.join(CERT_KEY_DEFAULT_PATH, f"{server_endpoint}.pem")
+    key_file_name = os.path.join(CERT_KEY_DEFAULT_PATH, f"{server_endpoint}-key.pem")
+    print("CERT FILE:", cert_file_name)
+    print("KEY FILE:", key_file_name)
+
+    more_args = ("--cert-file", cert_file_name, "--key-file", key_file_name) if args.use_ssl else ()
+
     if server_endpoint in active_hosts:
         skip_creation = True
 
@@ -549,13 +627,12 @@ def main():
         if args.celery:
             CeleryWorker(server_endpoint).start()
 
-        pre_command = []
         commands = []
         if args.sls:
             commands.append(f"python {location_managepy} generate_sls tmp_states -yy")
             commands.append(f"python {location_managepy} generate_extra_sls tmp_states_extra -yy")
 
-        django_server_activate(location_managepy, active_hosts[server_endpoint], commands)
+        django_server_activate(location_managepy, active_hosts[server_endpoint], commands, args=more_args, kwargs=args)
 
     elif not location_managepy:
         pprint('Exiting ...', Mode.FAIL)
